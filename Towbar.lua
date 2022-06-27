@@ -208,6 +208,8 @@ function Towbar:setTowbarVehicle(state, vehicle, jointIndex, noEventSend)
         end
     end
 
+    Towbar.updateActionText(self)
+
     setTowbarVehicleEvent.sendEvent(state, vehicle, jointIndex, noEventSend)
 end
 
