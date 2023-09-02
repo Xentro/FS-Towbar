@@ -1,11 +1,15 @@
 --
--- FS19 - Tow Bar
--- @author:    	Peppe978, TyKonKet, kenny456 - FS19 conversion (kenny456@seznam.cz)
--- @history:	v1.0 - 2019-01-02 - converted to FS19
+-- Towbar
 --
+-- Author:  Xentro
+-- Website: https://xentro.se, https://github.com/Xentro
+--
+-- This is an rewrite of the "Puller" script which was written by the following authors 
+-- Peppe978, TyKonKet
+-- 
 
 Towbar = {
-    MOD_NAME    = g_currentModName,
+    MOD_NAME = g_currentModName,
 }
 
 function Towbar.prerequisitesPresent(specializations)
@@ -17,12 +21,16 @@ function Towbar.initSpecialization()
     local schemaSavegame = Vehicle.xmlSchemaSavegame
 
     schema:setXMLSpecializationType("Towbar")
-    schema:register(XMLValueType.NODE_INDEX, "vehicle.towbar#node",                    "")
-    schema:register(XMLValueType.NODE_INDEX, "vehicle.towbar#rootNode",                "")
-    schema:register(XMLValueType.FLOAT,      "vehicle.towbar#attachDistance",          "")
-    schema:register(XMLValueType.BOOL,       "vehicle.towbar#isGrabbable",             "")
-    schema:register(XMLValueType.BOOL,       "vehicle.towbar#isGrabbableOnlyIfDetach", "")
-    schema:register(XMLValueType.STRING,     "vehicle.towbar#inputName",               "", "IMPLEMENT_EXTRA2")
+    schema:register(XMLValueType.NODE_INDEX, "vehicle.towbar#node",                    "towbar joint node")
+    schema:register(XMLValueType.NODE_INDEX, "vehicle.towbar#rootNode",                "rootNode used to create towbar joint")
+    schema:register(XMLValueType.FLOAT,      "vehicle.towbar#attachDistance",          "Attach distance to towbar vehicle")
+    schema:register(XMLValueType.BOOL,       "vehicle.towbar#isGrabbable",             "Allow attach to towbar")
+    schema:register(XMLValueType.BOOL,       "vehicle.towbar#isGrabbableOnlyIfDetach", "Allow attach to towbar only if not attached to something")
+    schema:register(XMLValueType.BOOL,       "vehicle.towbar#matchParentVehicle",      "Match brake and motor to parent vehicle")
+    schema:register(XMLValueType.STRING,     "vehicle.towbar#inputName",               "Input name", "IMPLEMENT_EXTRA2")
+
+    schemaSavegame:register(XMLValueType.INT, "vehicles.vehicle(?).towbar#vehicleId",  "Vehicle id of attached vehicle")
+    schemaSavegame:register(XMLValueType.INT, "vehicles.vehicle(?).towbar#jointIndex", "Index of attacher joint")
 end
 
 function Towbar.registerFunctions(vehicleType)
@@ -32,6 +40,7 @@ end
 
 function Towbar.registerEventListeners(vehicleType)
 	SpecializationUtil.registerEventListener(vehicleType, "onLoad", Towbar)
+	SpecializationUtil.registerEventListener(vehicleType, "onPostLoad", Towbar)
 	SpecializationUtil.registerEventListener(vehicleType, "onDelete", Towbar)
 	SpecializationUtil.registerEventListener(vehicleType, "onReadStream", Towbar)
 	SpecializationUtil.registerEventListener(vehicleType, "onWriteStream", Towbar)
@@ -46,8 +55,9 @@ function Towbar:onLoad(vehicle)
     spec.attachNode              = self.xmlFile:getValue("vehicle.towbar#node", nil, self.components, self.i3dMappings)
     spec.attachRootNode          = self.xmlFile:getValue("vehicle.towbar#rootNode", "0>", self.components, self.i3dMappings)
     spec.attachDistance          = self.xmlFile:getValue("vehicle.towbar#attachDistance", 1.5)
-    spec.isGrabbable             = self.xmlFile:getValue("vehicle.towbar#isGrabbable", false)
-    spec.isGrabbableOnlyIfDetach = self.xmlFile:getValue("vehicle.towbar#isGrabbableOnlyIfDetach", false)
+    spec.isGrabbable             = self.xmlFile:getValue("vehicle.towbar#isGrabbable", true)
+    spec.isGrabbableOnlyIfDetach = self.xmlFile:getValue("vehicle.towbar#isGrabbableOnlyIfDetach", true)
+    spec.matchParentVehicle      = self.xmlFile:getValue("vehicle.towbar#matchParentVehicle", false)
     local inputName              = self.xmlFile:getValue("vehicle.towbar#inputName")
 
     if inputName ~= nil then
@@ -64,11 +74,38 @@ function Towbar:onLoad(vehicle)
     assert(spec.attachNode ~= nil, "Towbar: Couldn't find an valid node for vehicle.towbar.node")
 end
 
+function Towbar:onPostLoad(savegame)
+    local spec = self.spec_towbar
+
+    if savegame ~= nil and not savegame.resetVehicles then
+        local vehicleId = savegame.xmlFile:getValue(savegame.key .. ".towbar#vehicleId")
+        local jointIndex = savegame.xmlFile:getValue(savegame.key .. ".towbar#jointIndex")
+
+        if vehicleId ~= nil and jointIndex ~= nil then
+            spec.attachOnLoad = {
+                vehicleId = vehicleId,
+                index = jointIndex
+            }
+        end
+    end
+end
+
 function Towbar:onDelete()
     local spec = self.spec_towbar
 
     if spec.isAttached then
         self:setTowbarVehicle(Towbar.STATE_DETACH, nil, nil, true)
+    end
+end
+
+function Towbar:saveToXMLFile(xmlFile, key, usedModNames)
+    local spec = self.spec_towbar
+    local avj = spec.attachedVehicleJoint
+    local keyUpdate = key:gsub("." .. Towbar.MOD_NAME, "") -- I do not want the mod name...
+
+    if spec.isAttached ~= nil and avj ~= nil and avj.vehicle ~= nil then
+        xmlFile:setValue(keyUpdate .. "#vehicleId",  avj.vehicle.currentSavegameId)
+        xmlFile:setValue(keyUpdate .. "#jointIndex", avj.attacherJointIndex)
     end
 end
 
@@ -79,7 +116,9 @@ function Towbar:onReadStream(streamId, connection)
         local vehicle = NetworkUtil.readNodeObject(streamId)
         local index = streamReadInt8(streamId)
 
-        self:setTowbarVehicle(Towbar.STATE_ATTACH, vehicle, index, true)
+        if vehicle ~= nil and vehicle:getIsSynchronized() then
+            self:setTowbarVehicle(Towbar.STATE_ATTACH, vehicle, index, true)
+        end
     end
 end
 
@@ -96,6 +135,90 @@ end
 
 function Towbar:onUpdateTick(dt, isActiveForInput, isActiveForInputIgnoreSelection, isSelected)
     local spec = self.spec_towbar
+
+    if spec.attachOnLoad ~= nil then
+        local vehicle = g_currentMission.savegameIdToVehicle[spec.attachOnLoad.vehicleId]
+
+        if vehicle ~= nil then 
+            self:setTowbarVehicle(Towbar.STATE_ATTACH, vehicle, spec.attachOnLoad.index, true)
+        end
+
+        spec.attachOnLoad = nil
+    end
+
+    if spec.attachedVehicleJoint ~= nil then
+        if spec.isAttached and not spec.attachedVehicleJoint.vehicle.spec_enterable.isControlled then
+            local vehicle = spec.attachedVehicleJoint.vehicle
+            local inputJoint = self.spec_attachable.attacherJoint -- Created upon attaching to vehicle
+            
+            if inputJoint ~= nil then
+                -- Turn towed vehicle towards input attacher joint
+                local xTarget, yTarget, zTarget = getWorldTranslation(inputJoint.node)
+                local tX, _, tZ = worldToLocal(vehicle.rootNode, xTarget, yTarget, zTarget)
+
+                local tX_2 = tX * 0.5
+                local tZ_2 = tZ * 0.5
+
+                local d1X, d1Z = tZ_2, -tX_2
+                if tX > 0 then
+                    d1X, d1Z = -tZ_2, tX_2
+                end
+
+                local rotTime = 0
+                local hit, _, f2 = MathUtil.getLineLineIntersection2D(tX_2,tZ_2, d1X,d1Z, 0,0, tX, 0)
+                
+                if hit and math.abs(f2) < 100000 then
+                    local radius = tX * f2
+
+                    rotTime = vehicle:getSteeringRotTimeByCurvature(1 / radius)
+
+                    if vehicle:getReverserDirection() < 0 then
+                        rotTime = -rotTime
+                    end
+                end
+
+                local targetRotTime
+
+                if rotTime >= 0 then
+                    targetRotTime = math.min(rotTime, vehicle.maxRotTime)
+                else
+                    targetRotTime = math.max(rotTime, vehicle.minRotTime)
+                end
+
+                if targetRotTime > vehicle.rotatedTime then
+                    vehicle.rotatedTime = math.min(vehicle.rotatedTime + dt*vehicle:getAISteeringSpeed(), targetRotTime)
+                else
+                    vehicle.rotatedTime = math.max(vehicle.rotatedTime - dt*vehicle:getAISteeringSpeed(), targetRotTime)
+                end
+				
+                local attacherVehicle = self:getAttacherVehicle()
+				if spec.matchParentVehicle and attacherVehicle ~= nil then
+                    -- Match to parent Vehicle
+					vehicle.spec_wheels.brakePedal = attacherVehicle.spec_wheels.brakePedal
+                    
+                    -- Work In Progress
+                    -- check motor and match
+				else
+					-- Keep brakes inactive as long as nothing controls vehicle
+					vehicle.spec_wheels.brakePedal = 0
+				end
+			else
+                -- Nothing attached infront, put the brakes back!
+                vehicle.spec_wheels.brakePedal = 1
+            end
+        else
+            -- Keep active to force vehicle to stop if its moving upon detach
+            if spec.detachTimer ~= nil then
+                if spec.detachTimer > 0 then
+                    spec.detachTimer = spec.detachTimer - dt
+                else
+                    spec.detachTimer = nil
+                    spec.attachedVehicleJoint.vehicle.forceIsActive = false
+                    spec.attachedVehicleJoint = nil
+                end
+            end
+        end
+    end
 
     if isActiveForInputIgnoreSelection then
         if not spec.isAttached then
@@ -162,27 +285,32 @@ function Towbar:setTowbarVehicle(state, vehicle, jointIndex, noEventSend)
 
     if state == Towbar.STATE_DETACH then
         if self.isServer then
-            vehicle = spec.attachedVehicleJoint.vehicle
             removeJoint(spec.attachedVehicleJoint.index)
-
-            if not vehicle.isControlled and vehicle.motor ~= nil and vehicle.wheels ~= nil then
-                for k, wheel in pairs(vehicle.wheels) do
-                    setWheelShapeProps(wheel.node, wheel.wheelShape, 0, vehicle.motor.brakeForce, 0, wheel.rotationDamping)
-                end
-            end
         end
 
-        spec.attachedVehicleJoint = nil
+        vehicle = spec.attachedVehicleJoint.vehicle
+        vehicle.isBroken = spec.attachedVehicleJoint.isBroken
+
+        if not vehicle.spec_enterable.isControlled then
+            vehicle.spec_wheels.brakePedal = 1
+        end
+
         spec.isAttached = false
+        spec.detachTimer = 500
 
     elseif state == Towbar.STATE_ATTACH then
-        -- vehicle.isBroken = false
-
-        vehicle.forceIsActive = true
-        spec.isAttached = true
         spec.attachedVehicleJoint = {
-            vehicle = vehicle
+            vehicle = vehicle,
+            isBroken = vehicle.isBroken
         }
+        spec.isAttached = true
+        vehicle.forceIsActive = true
+        vehicle.isBroken = false
+
+        if not vehicle.spec_enterable.isControlled then
+            vehicle.rotatedTime = 0
+            vehicle.spec_wheels.brakePedal = 0
+        end
 
         if self.isServer then
             local jointDesc = vehicle.spec_attacherJoints.attacherJoints[jointIndex]
@@ -199,16 +327,12 @@ function Towbar:setTowbarVehicle(state, vehicle, jointIndex, noEventSend)
 
             spec.attachedVehicleJoint.index = constr:finalize()
             spec.attachedVehicleJoint.attacherJointIndex = jointIndex
-
-            if not vehicle.isControlled and vehicle.motor ~= nil and vehicle.wheels ~= nil then
-                for k, wheel in pairs(vehicle.wheels) do
-                    setWheelShapeProps(wheel.node, wheel.wheelShape, 0, 0, 0, wheel.rotationDamping)
-                end
-            end
         end
     end
 
-    Towbar.updateActionText(self)
+    if self.isClient then
+        Towbar.updateActionText(self)
+    end
 
     setTowbarVehicleEvent.sendEvent(state, vehicle, jointIndex, noEventSend)
 end
@@ -297,6 +421,12 @@ function Towbar:updateDebugValues(values)
 
     if spec.vehicleInRange ~= nil then
         table.insert(values, {name = "In Range distance", value = string.format("%.2f", spec.vehicleInRange.distance)})
+    end
+
+    if spec.attachedVehicleJoint ~= nil then
+        local v = spec.attachedVehicleJoint.vehicle
+        table.insert(values, {name = "rotatedTime", value = string.format("%.2f", v.rotatedTime)})
+        table.insert(values, {name = "brakePedal", value = string.format("%.2f", v.spec_wheels.brakePedal)})
     end
 end
 
